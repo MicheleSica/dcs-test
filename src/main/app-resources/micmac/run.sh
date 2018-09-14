@@ -1,0 +1,155 @@
+#!/bin/bash
+
+# do not let errors run away
+set -e
+
+export PATH=/application/micmac:/application/gdal:/usr/local/gdal-t2/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/gdal-t2/lib:$LD_LIBRARY_PATH
+export GDAL_DATA=/usr/local/gdal-t2/share/gdal
+
+# define the exit codes
+SUCCESS=0
+ERR_CATALOG=100
+ERR_SENSOR_NOT_SUPPORTED=101
+
+# source the ciop functions (e.g. ciop-log)
+source $ciop_job_include
+
+# add a trap to exit gracefully
+clean_exit()
+{
+    local retval=$?
+    local msg=""
+
+    # Create return message
+    case "$retval" in
+    $SUCCESS) msg="Processing successfully concluded";;
+    $ERR_CATALOG) msg="Could not retrieve reference from catalog";;
+    $ERR_SENSOR_NOT_SUPPORTED) msg="This sensor is not supported yet";;
+    *) msg="Unknown error";;
+    esac
+
+    if [ "$retval" != "0" ]; then
+        ciop-log "ERROR" "Error $retval - $msg, processing aborted"
+    else
+        ciop-log "INFO" "$msg"
+    fi
+
+    exit $retval
+}
+trap clean_exit EXIT
+
+# ROI
+roi=$(ciop-getparam roi | tr "," " ")
+ciop-log "INFO" "ROI is '$roi'"
+
+# Cloud level threshold
+cloud_thres=$(ciop-getparam cloud_thres)
+
+# Get the maximum number of pairs we generate for a specific date
+max_pairs_per_date=$(ciop-getparam max_pairs_per_date)
+
+# Do we remove median term from pairs?
+rm_median=$(ciop-getparam rm_median)
+
+# switch to TMPDIR
+ciop-log "INFO" "Change dir to '$TMPDIR'"
+cd $TMPDIR
+
+# Fetch datasets
+dates=""
+while read ref; do
+    if [ -z "$ref" ]; then
+        continue
+    fi
+
+	# Fetch image
+	ciop-log "INFO" "Process reference '$ref'"
+    date=$(opensearch-client $ref startdate | cut -c 1-10 | tr -d "-")
+    img_dl=$(ciop-copy -o $TMPDIR "$(opensearch-client $ref enclosure)")
+    if [ -z "$date" -o -z "$img_dl" ]; then
+        continue
+    fi
+
+    # What happens here: we crop/mosaic the inputs
+    # into the desired frame. There may be overwrite.
+
+    crop_failed=0
+    case "$(basename $img_dl)" in
+    S2A_OPER_PRD_MSIL1C_PDMC_*|S2A_OPER_PRD_MSIL1C_PDMC_*|S2A_MSIL1C_*|S2B_MSIL1C_*)
+        safedir=$(ls -d $img_dl/*.SAFE)
+        ciop-log "INFO" "Cropping $safedir to ROI"
+        gdalwarp -q -overwrite -te $roi -te_srs 'urn:ogc:def:crs:OGC:1.3:CRS84' -r cubic $safedir/GRANULE/*/IMG_DATA/*_B03.jp2 ${date}.tiff || crop_failed=1
+        gdalwarp -q -overwrite -te $roi -te_srs 'urn:ogc:def:crs:OGC:1.3:CRS84' -r cubic $safedir/GRANULE/*/IMG_DATA/*_B09.jp2 ${date}_clouds.tiff || crop_failed=1
+        ;;
+    *)
+        exit $ERR_SENSOR_NOT_SUPPORTED
+    esac
+    if [ $crop_failed -eq 1 ]; then
+        rm -Rf $img_dl
+        continue
+    fi
+    
+    # Get image and cloud mask mean value to check wheter we keep the date or not
+    img_mean=$(gdalinfo -stats ${date}.tiff | grep 'STATISTICS_MEAN=' | cut -d= -f2)
+    cloud_mean=$(gdalinfo -stats ${date}_clouds.tiff | grep 'STATISTICS_MEAN=' | cut -d= -f2)
+    ciop-log "INFO" "Cloud mask mean for ${date}: $cloud_mean (threshold: $cloud_thres)"
+    if [ $(echo "$img_mean > 0 && $cloud_mean < $cloud_thres"|bc) -eq 1 ]; then
+        dates="$dates $date"
+    else
+        rm -f ${date}.tiff ${date}_clouds.tiff
+    fi
+
+    # Do not keep original product, they take a lot of space
+	rm -Rf $img_dl
+done
+
+# Ok, sort dates
+dates=$(echo $dates | tr ' ' '\\n' | sort -nu | tr '\\n' ' ')
+ciop-log "INFO" "Available acquisitions: $dates"
+
+# Create correlations maps
+for date1 in $dates; do
+    count=0
+    for date2 in $dates; do
+        if [ "$date1" -ge "$date2" ]; then
+            continue
+        fi
+        if [ $count -ge $max_pairs_per_date ]; then
+            continue
+        fi
+
+
+        ciop-log "INFO" "Processing $date1-$date2 pair"
+        mm3d MICMAC /application/micmac/ParamSatDequant.xml WorkDir=./ +DirMEC=MEC/ +Im1=${date1}.tiff +Im2=${date2}.tiff +Masq=
+
+
+        ciop-log "INFO" "Prepare publish directory for $date1-$date2 pair"
+        # Let's use the same name as MPIC for directories and files
+        # MPIC use dates with dash (-) separator
+        date1_dashed="$(echo $date1|cut -c1-4)-$(echo $date1|cut -c5-6)-$(echo $date1|cut -c7-8)"
+        date2_dashed="$(echo $date2|cut -c1-4)-$(echo $date2|cut -c5-6)-$(echo $date2|cut -c7-8)"
+        outdir="$TMPDIR/Out_${date1_dashed}_${date1_dashed}_B03_${date2_dashed}_${date2_dashed}_B03"
+        # Create directory
+        mkdir $outdir
+        # Copy displacement images
+        for f in Px1_Num5_DeZoom1_LeChantier.tif Px2_Num5_DeZoom1_LeChantier.tif; do
+            gdal_calc.py --calc 'A*0.1*10' --outfile $outdir/$f -A MECSat/$f --type Float32
+            if [ "x$rm_median" = "xyes" ]; then
+              remove_median.py $outdir/$f
+            fi
+            gdalcopyproj.py ${date1}.tiff $outdir/$f
+        done
+        # Copy correlation coeff image
+        mv MECSat/Correl_LeChantier_Num_5.tif $outdir
+        gdalcopyproj.py ${date1}.tiff $outdir/Correl_LeChantier_Num_5.tif
+        
+
+        ciop-log "INFO" "Publish $(basename $outdir)"
+        ciop-publish -r $outdir
+
+        ciop-log "INFO" "Clean after $date1-$date2 pair"
+        rm -Rf MECSat PyramSat $outdir
+        count=$(expr $count + 1)
+    done
+done
